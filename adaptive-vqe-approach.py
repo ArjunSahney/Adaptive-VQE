@@ -1,23 +1,23 @@
-# Import necessary libraries
-import pennylane as qml              # Quantum computing library
-from pennylane import numpy as np    # NumPy with autodifferentiation support from PennyLane
-import time                           # Library for tracking execution time
-import math                           # Library for mathematical functions
-import os                            # Library for monitoring memory usage
-import psutil                        # Library for more detailed system and process information
+import pennylane as qml
+from pennylane import numpy as np
+import time
+import math
+import os
+import psutil
+import gc
 
 # Define molecular geometry constants for Beryllium Hydride (BeH2)
-angHBeH = math.pi                     # Bond angle in radians (180 degrees for linear BeH2)
-lenBeH = 1.3264                       # Bond length in Angstroms
-angToBr = 1 / 0.529177210903          # Conversion factor from Angstroms to Bohr radii
+angHBeH = math.pi  # Bond angle in radians (180 degrees for linear BeH2)
+lenBeH = 1.3264  # Bond length in Angstroms
+angToBr = 1 / 0.529177210903  # Conversion factor from Angstroms to Bohr radii
 
 # Convert bond length from Angstroms to Bohr
-lenInBr = lenBeH * angToBr            
-cx = lenInBr * math.sin(0.5 * angHBeH) # x-coordinate for hydrogen atoms
-cy = lenInBr * (math.cos(0.5 * angHBeH) + 1 - 1) # y-coordinate for Be atom, simplified calculation
+lenInBr = lenBeH * angToBr
+cx = lenInBr * math.sin(0.5 * angHBeH)  # x-coordinate for hydrogen atoms
+cy = lenInBr * math.cos(0.5 * angHBeH)  # y-coordinate for Be atom
 
 # Calculate the distance between the two hydrogen atoms
-lenHH = 2 * cx                       
+lenHH = 2 * cx
 
 # Define the symbols and coordinates for the nuclei in BeH2
 BeHHsymbols = ["Be", "H", "H"]
@@ -34,7 +34,7 @@ def create_molecule_and_hamiltonian(basis_name):
     )
     return BeH2, hamiltonian, n_qubits
 
-# Function to initialize VQE parameters and states
+# Function to initialize VQE parameters and states with a given basis set
 def initialize_vqe(basis_name):
     BeH2, h_vanilla, n_qubits = create_molecule_and_hamiltonian(basis_name)
     n_electrons = BeH2.n_electrons
@@ -49,13 +49,14 @@ def initialize_vqe(basis_name):
     
     return BeH2, h_vanilla, n_qubits, hf_state, singles, doubles, dev, energy_expval_ASD
 
-# Initial basis set
-basis_sets = ['sto-3g', 'cc-pVDZ']  # Simplified basis sets for initial testing
-initial_basis = basis_sets[0]
-BeH2, h_vanilla, n_qubits, hf_state, singles, doubles, dev, energy_expval_ASD = initialize_vqe(initial_basis)
+# Define initial basis sets for adaptive VQE
+basis_sets = ['sto-3g', '6-31g', '6-311g', 'cc-pvdz']
+
+# Initialize with the smallest basis set 'sto-3g'
+BeH2, h_vanilla, n_qubits, hf_state, singles, doubles, dev, energy_expval_ASD = initialize_vqe('sto-3g')
 
 # Print out basic information about the VQE setup
-print("\n<Info of vanilla VQE>")
+print("\n<Info of VQE with smallest basis>")
 print("Number of qubits needed:", n_qubits)
 print('Number of Pauli strings:', len(h_vanilla.ops))
 
@@ -65,16 +66,24 @@ def get_memory_usage():
     mem_info = process.memory_info()
     return mem_info.rss / (1024 ** 2)  # Return memory usage in MB
 
-# Function to run the VQE algorithm with adaptive basis sets
-def run_vqe_adaptive(params, opt, iterations, basis_sets, energy_threshold):
+# Function to dynamically adjust the energy threshold
+def adjust_threshold(energies, current_threshold):
+    if len(energies) < 2:
+        return current_threshold
+    improvement = energies[-2] - energies[-1]
+    if improvement < 0.005:  # Stricter improvement condition
+        return current_threshold * 0.95  # Reduce threshold by 5%
+    return current_threshold
+
+# Function to run the VQE algorithm with adaptive basis sets and dynamic threshold
+def run_vqe_adaptive(params, opt, iterations, basis_sets, initial_threshold, min_iterations_per_basis=10):
     ti = time.time()
     energies = []
     runtime = []
     current_basis_index = 0
+    energy_threshold = initial_threshold
 
-    global energy_expval_ASD  # Ensure energy_expval_ASD is accessible inside the function
-
-    BeH2, h_vanilla, n_qubits, hf_state, singles, doubles, dev = [None] * 7
+    global energy_expval_ASD
 
     for i in range(iterations):
         t1 = time.time()
@@ -83,29 +92,21 @@ def run_vqe_adaptive(params, opt, iterations, basis_sets, energy_threshold):
         runtime.append(t2 - ti)
         energies.append(energy)
         print(f"Iteration {i + 1}, Energy: {energy} Ha, Memory Usage: {get_memory_usage()} MB")
-        if (i + 1) % 5 == 0:
-            print(f"Completed iteration: {i + 1}")
-            print(f"Energy: {energy} Ha")
-            print("Step Time:", t2 - t1, "s")
-            print("----------------")
-        if energy_threshold and energy < energy_threshold:
-            print(f"Energy threshold reached: {energy} Ha")
-            if current_basis_index < len(basis_sets) - 1:
+        
+        # Adjust the threshold dynamically
+        energy_threshold = adjust_threshold(energies, energy_threshold)
+        
+        if (i + 1) % min_iterations_per_basis == 0 or energy < energy_threshold:
+            if current_basis_index < len(basis_sets) - 1 and (i + 1) >= min_iterations_per_basis:
                 current_basis_index += 1
                 new_basis = basis_sets[current_basis_index]
-                print(f"Switching to new basis set: {new_basis}")
-                # Free memory by deleting the old objects
-                if BeH2 is not None:
-                    del BeH2, h_vanilla, n_qubits, hf_state, singles, doubles, dev
-                    import gc
-                    gc.collect()
+                print(f"Switching to new basis set: {new_basis} due to insufficient improvement or reaching the threshold.")
                 BeH2, h_vanilla, n_qubits, hf_state, singles, doubles, dev, energy_expval_ASD = initialize_vqe(new_basis)
-                # Reinitialize the parameters with the correct shape
                 params = np.zeros(len(singles) + len(doubles), requires_grad=True)
-                energy_threshold /= 10  # Adjust threshold for next stage if needed
             else:
-                print("No more basis sets to switch to.")
+                print("No more basis sets to switch to, or improvement is satisfactory.")
                 break
+
     print(f"Optimized energy: {energy} Ha")
     return energies, runtime, basis_sets[current_basis_index]
 
@@ -116,8 +117,8 @@ params_vanilla = np.zeros(len(doubles) + len(singles), requires_grad=True)
 adam_opt = qml.AdamOptimizer(stepsize=0.02, beta1=0.9, beta2=0.99, eps=1e-08)
 
 # Execute the VQE algorithm and capture energies and runtimes
-adaptive_basis_threshold = 1e-3  # Energy threshold for switching basis sets
-energies_vanilla, runtime_vanilla, final_basis = run_vqe_adaptive(params_vanilla, adam_opt, 20, basis_sets, energy_threshold=adaptive_basis_threshold)
+initial_threshold = -30.0  # Higher initial energy threshold
+min_iterations_per_basis = 20  # Minimum iterations to run before switching basis sets
+energies_vanilla, runtime_vanilla, final_basis = run_vqe_adaptive(params_vanilla, adam_opt, 100, basis_sets, initial_threshold, min_iterations_per_basis)
 
 print(f"Final basis set used: {final_basis}")
-
